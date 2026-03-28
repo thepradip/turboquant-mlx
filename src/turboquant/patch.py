@@ -1,17 +1,17 @@
 """
-Patch any MLX model to use TurboQuant compressed KV cache.
+TurboQuant for MLX — compress KV cache, extend context length.
 
-Two modes:
-  1. compress_cache() — compress in-place after prefill (simple, works well)
-  2. patch_model() — replace attention with QJL-corrected version (full algorithm)
+Main API:
+  1. compress_cache() — compress KV after prefill
+  2. chunked_prefill() — process long prompts in chunks (bypasses Metal 8GB limit)
 
-Usage (simple):
-    compress_cache(cache, model=model)
+Usage:
+    from turboquant import compress_cache, chunked_prefill
 
-Usage (full QJL):
-    patch_model(model, bits=4)
-    cache = make_turboquant_cache(model, bits=4)
-    logits = model(ids[None], cache=cache)  # uses QJL-corrected attention
+    cache = make_prompt_cache(model)
+    logits = chunked_prefill(model, ids, cache)  # handles any context length
+    compress_cache(cache, model=model, bits=4)    # compress KV
+    # generate from compressed cache...
 """
 
 import time
@@ -59,6 +59,51 @@ def get_model_config(model) -> Dict:
         "num_attention_heads": n_heads,
         "hidden_size": hidden,
     }
+
+
+def chunked_prefill(
+    model: Any,
+    ids: "mx.array",
+    cache: List[Any],
+    chunk_size: int = 2048,
+) -> "mx.array":
+    """
+    Process long prompts in chunks to bypass Metal's 8GB buffer limit.
+
+    Standard prefill crashes at ~15K tokens because the attention matrix
+    (n_heads × seq × seq × 4 bytes) exceeds Metal's single allocation limit.
+    Chunked prefill processes 2048 tokens at a time, so the max attention
+    matrix is only (n_heads × 2048 × 2048 × 4) = ~128MB.
+
+    Tested: 86K tokens on M2 Pro 16GB with Qwen3.5-2B-OptiQ-4bit.
+
+    Args:
+        model: MLX model.
+        ids: Token IDs as 1D mx.array (not batched).
+        cache: KV cache from make_prompt_cache(model).
+        chunk_size: Tokens per chunk. 2048 is safe for all models.
+
+    Returns:
+        logits from the last chunk (use for first token generation).
+
+    Example::
+
+        cache = make_prompt_cache(model)
+        logits = chunked_prefill(model, ids, cache)
+        compress_cache(cache, model=model, bits=4)
+        y = mx.argmax(logits[:, -1, :], axis=-1)
+        # continue generation...
+    """
+    total = len(ids)
+    logits = None
+
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk = ids[start:end]
+        logits = model(chunk[None], cache=cache)
+        mx.eval(logits)
+
+    return logits
 
 
 def compress_cache(

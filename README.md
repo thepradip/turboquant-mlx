@@ -71,20 +71,41 @@ Questions tested: Fundamental Rights, Amendment process (Art 368), President's p
 | Gemma 3 4B | 5/5 |
 | Qwen 2.5 1.5B | 4/5 (code generation degrades) |
 
-### Max context on M2 Pro 16GB (tested, not theoretical)
+### Max context on M2 Pro 16GB
 
-| Model | Max Context Tested | Status |
-|-------|:---:|:---:|
-| Qwen 3.5 9B (4-bit, 5.3GB) | 15K tokens | OK |
-| Qwen 3.5 9B (4-bit, 5.3GB) | 17K tokens | Crashes (Metal 8GB buffer limit) |
-| Qwen 3.5 2B (4.3GB) | 9K tokens | OK |
-| Gemma 3 4B (4-bit, 3.2GB) | 9K tokens | OK |
+With `chunked_prefill()` — bypasses Metal's 8GB single allocation limit:
 
-Metal's 8GB single allocation limit is the real bottleneck on Apple Silicon, not total RAM.
+| Model | Max Context | KV Saved | Status |
+|-------|:---:|:---:|:---:|
+| Qwen3.5-2B-OptiQ-4bit (1.4GB) | **86,217** | 754 MB | OK |
+| Qwen3.5-4B-MLX-4bit (2.3GB) | **15,565** | 363 MB | OK |
+| Gemma3-4B-4bit (2.4GB) | **13,706** | 1,324 MB | OK |
+
+Without chunked prefill, all models crash at ~15K due to Metal's 8GB buffer limit.
+With chunked prefill, the 2B model handles **86K tokens** on 16GB RAM.
 
 ### AI Paper QA (23 pages, ~8K context)
 
 Tested on "Reliable AI Agents in Python" paper with questions about SLIs/SLOs, Python stack, retry strategies, LangGraph vs OpenAI SDK, observability. Qwen3.5-2B: **5/5 correct, answers match FP16 baseline**.
+
+## Long Context (chunked prefill)
+
+```python
+from turboquant import compress_cache, chunked_prefill
+from mlx_lm.models.cache import make_prompt_cache
+
+# Handles any context length — 86K+ tokens on 16GB
+cache = make_prompt_cache(model)
+ids = mx.array(tok.encode(text))
+logits = chunked_prefill(model, ids, cache, chunk_size=2048)
+mx.eval(logits)
+
+compress_cache(cache, model=model, bits=4)
+
+# Generate
+y = mx.argmax(logits[:, -1, :], axis=-1)
+# ...
+```
 
 ## How It Works
 

@@ -3,6 +3,7 @@ __version__ = "0.4.0"
 
 from .patch import (
     compress_cache,
+    chunked_prefill,
     patch_model,
     make_turboquant_cache,
     get_head_dim,
