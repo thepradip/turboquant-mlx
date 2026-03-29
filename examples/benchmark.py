@@ -133,6 +133,14 @@ def run_single_test(model, tokenizer, ids, context_len, mode, model_name):
             compress_result = compress_cache(cache, model=model, bits=BITS)
             compress_ms = compress_result.get("compress_ms", 0)
             result["kv_memory_after_mb"] = round(measure_kv_mb(cache), 1)
+            # v0.5.0: measure real compressed size from indices+norms
+            comp_bytes = 0
+            for c in cache:
+                if hasattr(c, '_tq_k_indices') and c._tq_k_indices is not None:
+                    comp_bytes += c._tq_k_indices.nbytes + c._tq_k_norms.nbytes
+                    comp_bytes += c._tq_v_indices.nbytes + c._tq_v_norms.nbytes
+            if comp_bytes > 0:
+                result["kv_compressed_mb"] = round(comp_bytes / 1024 / 1024, 1)
             result.update(compress_result)
 
         elif mode == "mlx_quantized":
