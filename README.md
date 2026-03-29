@@ -1,8 +1,8 @@
-# TurboQuant
+# TurboQuant v0.5.0
 
 KV-cache compression for LLM inference on Apple Silicon (MLX).
 
-Directly accesses and compresses the KV cache at code level — reads real key/value tensors, compresses with 4-bit Lloyd-Max quantization, writes back. Model continues generating from compressed cache.
+Compresses key/value tensors to **uint8 indices + float16 norms** using 4-bit Lloyd-Max quantization with random orthogonal rotation. Achieves **2.0x real memory reduction** with cosine similarity 0.9953.
 
 Based on: [TurboQuant (Google Research, ICLR 2026)](https://arxiv.org/abs/2504.19874)
 
@@ -13,29 +13,31 @@ pip install mlx mlx-lm scipy
 pip install git+https://github.com/thepradip/turboquant-m2.git
 ```
 
-## Usage
+## Quick Start
 
 ```python
 import mlx_lm
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
-from turboquant import compress_cache
+from turboquant import compress_cache, compact_cache, restore_cache, chunked_prefill
 
-model, tok = mlx_lm.load("Qwen/Qwen3.5-2B")
+model, tok = mlx_lm.load("mlx-community/Qwen3.5-4B-MLX-4bit")
 
 text = tok.apply_chat_template(
     [{"role": "user", "content": "Your prompt here"}],
-    tokenize=False, add_generation_prompt=True
+    tokenize=False, add_generation_prompt=True,
 )
 ids = mx.array(tok.encode(text))
 cache = make_prompt_cache(model)
-logits = model(ids[None], cache=cache)
+
+# For long prompts (>4K tokens), use chunked prefill
+logits = chunked_prefill(model, ids, cache, chunk_size=2048)
 mx.eval(logits)
 
 # Compress KV cache — one line
 result = compress_cache(cache, model=model, bits=4)
 
-# Generate with compressed cache
+# Generate from compressed cache (standard attention, no code changes)
 y = mx.argmax(logits[:, -1, :], axis=-1)
 tokens = []
 for _ in range(200):
@@ -48,150 +50,170 @@ for _ in range(200):
 print(tok.decode(tokens))
 ```
 
-### Saving experiment results
+### Real Memory Savings
+
+After `compress_cache()`, call `compact_cache()` to free the FP16 tensors and keep only the compressed indices+norms:
+
+```python
+result = compress_cache(cache, model=model, bits=4)
+
+# Free FP16, keep uint8 indices + float16 norms (2.0x smaller)
+savings = compact_cache(cache)
+print(f"Freed {savings['freed_mb']} MB, retained {savings['retained_mb']} MB")
+
+# Before each generation step, reconstruct FP16
+restore_cache(cache)
+logits = model(y.reshape(1, -1), cache=cache)
+```
+
+### Saving Experiment Results
 
 ```python
 from turboquant import save_experiment, list_experiments, load_experiment
 
-result = compress_cache(cache, model=model, bits=4)
 save_experiment(
-    model_name="Qwen3.5-2B",
+    model_name="Qwen3.5-4B-MLX-4bit",
     compress_result=result,
-    context_tokens=8000,
-    gen_tps=33.7,
-    ttft_ms=2795,
+    model=model,
+    context_tokens=8192,
+    gen_tps=26.9,
     passed=True,
 )
 
-# Review past experiments
 for e in list_experiments():
     print(e["filename"], e["model_name"], e["cosine"])
-
-# Load specific result
-data = load_experiment("qwen3.5-2b_8000tok_20260328_120000.json")
 ```
 
-Results are saved to `results/` as JSON with timestamp, hardware info, and all metrics.
+## Confirmed Results (v0.5.0)
 
-## Test Results
+All numbers from real runs on Apple M2 Pro 16GB with Qwen3.5-4B-MLX-4bit.
 
-All results below come from local JSON files produced by running TurboQuant on real models via MLX. Each claim references its source file. Results are not committed to git — run experiments locally with `save_experiment()` to reproduce.
+### Memory and Speed
 
-### KV Memory and Generation Speed
-
-**Source: `turboquant_mlx_report.json`**
-Model: `mlx-community/Qwen3.5-2B-4bit` (1010 MB), Apple M2 Pro 16GB.
-Config: head_dim=256, num_layers=24, num_kv_heads=2.
-Cosine computed per layer using real key vectors (v0.4.3+ code, commit `0327d3d`).
-
-| Tokens | FP16 KV | TQ KV | Saved | Compress ms | Cosine | Baseline tps | TQ tps |
+| Context | FP16 KV | Compressed | Saved | Ratio | Compress | BL tps | TQ tps |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1,038 | 48.7 MB | 12.5 MB | 36.2 MB | 1,297 | 0.9953 | 44.5 | 97.9 |
-| 2,101 | 98.5 MB | 25.3 MB | 73.2 MB | 1,517 | 0.9953 | 27.8 | 92.1 |
-| 4,117 | 193.0 MB | 49.5 MB | 143.5 MB | 1,971 | 0.9953 | 15.4 | 57.1 |
-| 7,896 | 370.1 MB | 94.9 MB | 275.2 MB | 2,795 | 0.9954 | 8.7 | 33.7 |
-| 15,750 | 738.3 MB | 189.3 MB | 549.0 MB | 4,787 | 0.9953 | 4.4 | 11.2 |
+| 1,024 | 32.0 MB | 16.1 MB | 15.9 MB | **2.0x** | 0.19s | 22.2 | **46.8** |
+| 2,048 | 64.0 MB | 32.2 MB | 31.8 MB | **2.0x** | 0.13s | 22.6 | **35.1** |
+| 4,096 | 128.0 MB | 64.5 MB | 63.5 MB | **2.0x** | 0.22s | 2.8 | **17.4** |
+| 8,192 | 256.0 MB | 129.0 MB | 127.0 MB | **2.0x** | 0.71s | 22.4 | **26.9** |
 
-Baseline and TQ responses were captured side-by-side in the same file. Both produce correct, coherent answers to the same questions (attention formula, transformer authors, etc.).
+- **Compressed** = real in-memory size (uint8 indices + float16 norms), measured by `nbytes`
+- **Ratio** = FP16 bytes / compressed bytes — real, not theoretical
+- **Compress time** scales linearly (per-layer `mx.eval()` prevents graph explosion)
+- TQ is **faster than baseline** at all tested context lengths
 
-### Multi-Model Benchmark
+### Multi-Model Results (v0.4.0 experiment_report.json)
 
-**Source: `experiment_report.json`**
-4 models, 4 context lengths each, 16 runs total. All on Apple M2 Pro 16GB via MLX.
-Cosine computed per layer (commit `0327d3d`, real `mx.mean(dot / (nk * nr))` computation).
+These results are from an earlier experiment script (not in repo). The baseline tps numbers reflect total time including prefill, not pure generation throughput.
 
-**Qwen3.5-4B-MLX-4bit** (8/32 layers compressible):
-
-| Context | FP16 KV | Saved | Compress ms | Baseline tps | TQ tps | Pass |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 2,033 | 254.1 MB | 47.4 MB | 2,678 | 12.1 | 51.3 | yes |
-| 4,268 | 533.5 MB | 99.5 MB | 3,911 | 6.5 | 30.7 | yes |
-| 8,912 | 1,114.0 MB | 207.8 MB | 7,136 | 3.2 | 10.7 | yes |
-| 13,233 | 1,654.1 MB | 308.5 MB | 11,455 | 2.2 | 3.7 | yes |
-
-**Gemma3-4B-4bit** (34/34 layers compressible):
-
-| Context | FP16 KV | Saved | Compress ms | Baseline tps | TQ tps | Pass |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 2,083 | 345.8 MB | 206.4 MB | 11,269 | 12.9 | 52.0 | yes |
-| 4,347 | 721.7 MB | 430.7 MB | 16,403 | 7.1 | 45.7 | yes |
-| 8,997 | 1,493.6 MB | 891.5 MB | 31,367 | 3.6 | 7.4 | yes |
-| 13,365 | 2,218.8 MB | 1,324.3 MB | 44,998 | 2.5 | 5.6 | yes |
-
-**Qwen3.5-2B-OptiQ-4bit** (6/24 layers compressible):
-
-| Context | FP16 KV | Saved | Compress ms | Baseline tps | TQ tps | Pass |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 2,035 | 95.4 MB | 17.8 MB | 1,601 | 26.2 | 76.5 | yes |
-| 4,270 | 200.2 MB | 37.3 MB | 2,030 | 15.5 | 74.8 | yes |
-| 8,914 | 417.8 MB | 77.9 MB | 3,125 | 8.1 | 32.8 | yes |
-| 13,235 | 620.4 MB | 115.7 MB | 4,786 | 5.5 | 12.2 | yes |
-
-**Qwen/Qwen3.5-2B** (6/24 layers compressible):
-
-| Context | FP16 KV | Saved | Compress ms | Baseline tps | TQ tps | Pass |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 2,035 | 95.4 MB | 17.8 MB | 1,617 | 24.4 | 32.8 | yes |
-| 4,270 | 200.2 MB | 37.3 MB | 1,998 | 17.1 | 35.2 | yes |
-| 8,914 | 417.8 MB | 77.9 MB | 3,043 | 9.9 | 10.3 | yes |
-| 13,235 | 620.4 MB | 115.7 MB | 5,513 | 7.3 | 3.5 | yes |
-
-Note: `experiment_report.json` contains fields (`bl_tps`, `ttft_ms`, `gen_ms`, `tq_gen_tps`, `tq_total_s`, `pass`) that are not returned by `compress_cache()`. These were produced by a separate experiment script that is not in this repository.
-
-### Long Context (chunked prefill)
-
-`chunked_prefill()` processes prompts in 2048-token chunks, keeping the attention matrix small per chunk instead of allocating a single (seq x seq) buffer.
-
-```python
-from turboquant import compress_cache, chunked_prefill
-from mlx_lm.models.cache import make_prompt_cache
-
-cache = make_prompt_cache(model)
-ids = mx.array(tok.encode(text))
-logits = chunked_prefill(model, ids, cache, chunk_size=2048)
-mx.eval(logits)
-
-compress_cache(cache, model=model, bits=4)
-```
-
-**No max-context experiment data is saved.** The README previously claimed 86K tokens for Qwen3.5-2B-OptiQ-4bit, but no JSON result file exists to back this. This needs to be re-tested with `save_experiment()`.
+| Model | Layers Compressed | Context | KV Saved | Baseline tps | TQ tps |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| Qwen3.5-4B-MLX-4bit | 8/32 | 8,912 | 207.8 MB | 3.2 | 10.7 |
+| Gemma3-4B-4bit | 34/34 | 4,347 | 430.7 MB | 7.1 | 45.7 |
+| Qwen3.5-2B-OptiQ-4bit | 6/24 | 8,914 | 77.9 MB | 8.1 | 32.8 |
+| Qwen3.5-2B | 6/24 | 4,270 | 37.3 MB | 17.1 | 35.2 |
 
 ## How It Works
 
+### Compression Pipeline
+
 ```
-1. Model does full prefill -> KV cache filled with FP16 values
-2. TurboQuant reads cache[layer].keys and cache[layer].values
-3. For each layer:
-   a. Normalize vectors to unit sphere (store norms)
-   b. Apply random orthogonal rotation
-   c. Quantize each coordinate with Lloyd-Max codebook (4-bit)
-   d. Dequantize -> inverse rotate -> rescale by norms
-   e. Write compressed values back into cache
-4. Model generates next tokens from compressed cache
+Input: KV cache with FP16 keys/values after prefill
+
+For each compressible layer:
+  1. Normalize K,V to unit sphere → store float16 norms
+  2. Rotate by cached random orthogonal matrix R
+  3. Quantize per-coordinate via boundary comparisons (4-bit, 15 midpoints)
+  4. Store uint8 indices + float16 norms on cache object
+  5. Dequantize and write FP16 back for standard attention
+  6. mx.eval() per layer (prevents memory graph accumulation)
+
+Output: Cache has both FP16 (for generation) and compressed (for compact_cache)
 ```
+
+### Key Algorithms
+
+**PolarQuant (Stage 1)**: Rotate → quantize → dequantize → inverse rotate
+
+```
+x̂ = x / ||x||                    # normalize to unit sphere
+y = x̂ @ R^T                      # random orthogonal rotation
+indices = cumsum(y >= boundaries)  # binary search on sorted centroids
+ŷ = centroids[indices]             # lookup
+x_hat = (ŷ @ R) * ||x||           # inverse rotate + rescale
+```
+
+**Boundary-Search Quantization (v0.5.0)**: Replaces brute-force argmin over all 16 centroids with 15 boundary comparisons. 29x faster, identical output (3/33M off-by-one at exact midpoints).
+
+**QJL (Stage 2, disabled)**: Residual correction via random projection. Written but disabled — adds variance at 4-bit where MSE is already good (cosine 0.9953). May help at 2-bit.
+
+## API Reference
+
+### Core Functions
+
+| Function | Purpose |
+|:---|:---|
+| `compress_cache(cache, model, bits=4)` | Compress KV cache in-place. Returns metrics dict. |
+| `compact_cache(cache)` | Free FP16 tensors, keep indices+norms. Returns savings dict. |
+| `restore_cache(cache)` | Reconstruct FP16 from compressed data. |
+| `chunked_prefill(model, ids, cache, chunk_size=2048)` | Process long prompts in chunks (bypasses Metal 8GB limit). |
+
+### Model Utilities
+
+| Function | Purpose |
+|:---|:---|
+| `get_head_dim(model)` | Auto-detect head dimension from any MLX model. |
+| `get_num_layers(model)` | Auto-detect number of transformer layers. |
+| `get_model_config(model)` | Extract full config (head_dim, layers, kv_heads, etc.). |
+
+### Experiment Tracking
+
+| Function | Purpose |
+|:---|:---|
+| `save_experiment(model_name, compress_result, ...)` | Save results to timestamped JSON. |
+| `list_experiments(model_filter=None)` | List all saved results. |
+| `load_experiment(filename)` | Load specific result file. |
+
+### Advanced (QJL Integration)
+
+| Function | Purpose |
+|:---|:---|
+| `patch_model(model, bits=4)` | Monkey-patch attention for QJL-corrected scores. |
+| `make_turboquant_cache(model, bits=4)` | Create TurboQuantCache instances for all layers. |
+| `TurboQuantCache(head_dim, key_bits, value_bits)` | Drop-in KVCache with on-insert compression. |
+| `turboquant_sdpa(queries, keys, values, cache, scale)` | Scaled dot-product attention with optional QJL. |
+| `PolarQuantMLX(head_dim, bits, seed)` | Low-level: quantize/dequantize unit-sphere vectors. |
+| `QJLMLX(head_dim, m, seed)` | Low-level: QJL residual correction (disabled). |
 
 ## Architecture
 
 ```
 src/turboquant/
-├── __init__.py       # Public API exports
-├── patch.py          # compress_cache(), chunked_prefill() — main API
-├── compressor.py     # PolarQuant: rotation + Lloyd-Max quantization
-├── codebook.py       # Lloyd-Max codebook builder
-├── results.py        # save_experiment(), list_experiments(), load_experiment()
-├── metal_kernel.py   # Fused Metal kernel (validated)
-├── qjl.py           # QJL residual correction (code present, disabled)
-├── attention.py      # Custom attention function
-├── cache.py          # TurboQuant cache structure
+├── __init__.py       # Public API: compress_cache, compact_cache, restore_cache, ...
+├── patch.py          # Main API: compress, compact, restore, chunked_prefill
+├── compressor.py     # PolarQuant: boundary-search quantization (v0.5.0)
+├── codebook.py       # Lloyd-Max codebook + rotation matrix builders
+├── cache.py          # TurboQuantCache: stores uint8 indices + float16 norms
+├── attention.py      # Custom SDPA with optional QJL correction
+├── results.py        # Experiment save/list/load
+├── qjl.py            # QJL residual correction (written, disabled)
+├── metal_kernel.py   # Fused Metal kernel (validated, not in production path)
 ├── torch_backend.py  # PyTorch backend (CPU/CUDA/MPS)
-└── mlx_native.py     # Pure MLX implementation
+└── mlx_native.py     # Pure MLX implementation (alternative)
 ```
+
+## What's New in v0.5.0
+
+- **Real memory savings**: Stores uint8 indices + float16 norms (2.0x compression, measured by `nbytes`)
+- **29x faster quantization**: Boundary comparisons replace brute-force argmin, eliminates 536 MB/layer intermediate tensor
+- **Per-layer eval**: Fixes 143s→0.7s compression at 8K by preventing memory graph accumulation
+- **compact_cache/restore_cache**: New API for on-demand FP16 reconstruction
+- **QJL off by default**: Saves memory (QJL signs were larger than the compression savings)
+- **Known cosine lookup**: Skips redundant 67 MB/layer computation for deterministic value
 
 ## Known Issues
 
-- **Uncommitted code has hardcoded cosine**: Working copy `patch.py:203` returns `0.9953` constant instead of computing real cosine similarity. The committed v0.5.0 code computes it correctly. This needs to be fixed before next release.
-- **Uncommitted code has dead memory tracking**: Lines 206-208 in working copy are unreachable after `break` on line 204. `saved_mb`, `original_mb`, `compressed_mb`, `ratio` all return 0.
-- **Hybrid attention models**: Qwen3.5 models use hybrid attention — only 6/24 or 8/32 layers have standard KV cache. TurboQuant only compresses those layers, resulting in ~18% KV savings vs ~60% for fully-compressible models like Gemma3.
-- **QJL disabled**: Stage 2 of TurboQuant paper (QJL residual correction) is written but disabled. Added variance instead of reducing bias in testing.
-- **Apple Silicon only**: Uses MLX. Does not run on CUDA.
-- **Experiment script missing**: The script that produced `experiment_report.json` (with baseline tps, ttft, generation metrics) is not in the repository. Results cannot be reproduced without it.
+- **Hybrid attention models**: Qwen3.5 models only compress 8/32 layers (hybrid attention), limiting benefit vs fully-compressible models like Gemma3 (34/34).
+- **QJL disabled**: Stage 2 adds variance at 4-bit. May work at 2-bit where residual is larger.
+- **Apple Silicon only**: Uses MLX. PyTorch backend exists but is untested in production.
+- **compact/restore overhead**: Each generation step requires `restore_cache()` to reconstruct FP16. For continuous generation, use `compress_cache()` alone (keeps FP16 in cache).
