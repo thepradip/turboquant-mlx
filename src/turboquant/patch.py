@@ -158,6 +158,8 @@ def compress_cache(
     total_orig = 0
     total_comp = 0
     layers_compressed = 0
+    cosine_sum = 0.0
+    cosine_count = 0
 
     # Pre-build all compressors (codebook cached, rotation cached)
     compressors = {}
@@ -199,8 +201,15 @@ def compress_cache(
         v_unit = v_f / v_norms
         v_indices = v_mse.quantize(v_unit)
 
+        # ── Measure real cosine BEFORE overwriting cache ──
+        # Compare original unit vectors vs dequantized unit vectors
+        k_recon_unit = k_mse.dequantize(k_indices)
+        layer_cos = mx.mean(mx.sum(k_unit * k_recon_unit, axis=-1))
+
         # ── Per-layer eval: prevents memory graph accumulation across layers ──
-        mx.eval(k_indices, k_norms, v_indices, v_norms)
+        mx.eval(k_indices, k_norms, v_indices, v_norms, layer_cos)
+        cosine_sum += layer_cos.item()
+        cosine_count += 1
 
         # ── Store compressed representation on the cache object ──
         # These attributes are read by decompress_cache() or during generation
@@ -217,7 +226,7 @@ def compress_cache(
         # This ensures the cache works with standard attention without any
         # code changes downstream. The compressed data is also stored above
         # for real memory savings when decompress_cache() is used.
-        k_hat = (k_mse.dequantize(k_indices) * k_norms).astype(k.dtype)
+        k_hat = (k_recon_unit * k_norms).astype(k.dtype)
         v_hat = (v_mse.dequantize(v_indices) * v_norms).astype(v.dtype)
         c.keys[:, :, :compress_end, :] = k_hat
         c.values[:, :, :compress_end, :] = v_hat
@@ -232,18 +241,8 @@ def compress_cache(
 
     elapsed_ms = (time.time() - t0) * 1000
 
-    # Use known cosine for this (bits, head_dim) — it's deterministic
-    cos = _KNOWN_COSINE.get((bits, head_dim), 0)
-    if cos == 0 and layers_compressed > 0:
-        # Unknown combination: compute on a small sample from the first compressed layer
-        for li in compressors:
-            c = cache[li]
-            if hasattr(c, '_tq_k_indices'):
-                sample_k = c.keys[:, :, :min(1024, c._tq_compress_end), :]
-                # Already dequantized, can't compute vs original anymore
-                # Fall back to known constant
-                cos = 0.995
-                break
+    # Real cosine: averaged across all compressed layers (measured before overwrite)
+    cos = cosine_sum / cosine_count if cosine_count > 0 else 0.0
 
     ratio = total_orig / total_comp if total_comp > 0 else 0
 
