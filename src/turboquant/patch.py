@@ -219,11 +219,6 @@ def compress_cache(
         c.values[:, :, :compress_end, :] = v_hat
         mx.eval(c.keys, c.values)
 
-        # ── Memory tracking ──
-        n_elements = k.size
-        total_orig += n_elements * 2 * 2  # K + V, 2 bytes each (FP16)
-        total_comp += (n_elements * bits / 8 + k.shape[2] * k.shape[1] * 2) * 2  # indices + norms, K+V
-
         layers_compressed += 1
 
     elapsed_ms = (time.time() - t0) * 1000
@@ -231,16 +226,34 @@ def compress_cache(
     # Real cosine: averaged across all compressed layers (measured before overwrite)
     cos = cosine_sum / cosine_count if cosine_count > 0 else 0.0
 
-    ratio = total_orig / total_comp if total_comp > 0 else 0
+    # ── Measure ACTUAL memory from real tensors, not formulas ──
+    actual_kv_bytes = 0  # FP16 keys + values still in cache
+    actual_compressed_bytes = 0  # uint8 indices + float16 norms
+
+    for c in cache:
+        if hasattr(c, 'keys') and c.keys is not None:
+            actual_kv_bytes += c.keys.nbytes + c.values.nbytes
+        if hasattr(c, '_tq_k_indices') and c._tq_k_indices is not None:
+            actual_compressed_bytes += (
+                c._tq_k_indices.nbytes + c._tq_k_norms.nbytes +
+                c._tq_v_indices.nbytes + c._tq_v_norms.nbytes
+            )
+
+    # After compress_cache(), FP16 tensors are still in memory (dequantized back).
+    # Call compact_cache() after this to free FP16 and get real savings.
+    # Report both: what's actually in memory, and what compact_cache() would achieve.
+    potential_mb = actual_compressed_bytes / 1024 / 1024
+    actual_mb = actual_kv_bytes / 1024 / 1024
+    ratio = actual_kv_bytes / actual_compressed_bytes if actual_compressed_bytes > 0 else 0
 
     return {
         "cosine": round(cos, 4),
         "compress_ms": round(elapsed_ms, 0),
         "layers_compressed": layers_compressed,
-        "original_mb": round(total_orig / 1024 / 1024, 1),
-        "compressed_mb": round(total_comp / 1024 / 1024, 1),
-        "saved_mb": round((total_orig - total_comp) / 1024 / 1024, 1),
+        "kv_cache_mb": round(actual_mb, 1),
+        "compressed_mb": round(potential_mb, 1),
         "ratio": round(ratio, 1),
+        "note": "KV cache still FP16 in memory. Call compact_cache() to free FP16 and get real savings.",
     }
 
 
