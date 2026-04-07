@@ -224,11 +224,12 @@ def compress_cache(
 
         layers_compressed += 1
 
-    # ── Measure FP16 memory BEFORE compacting ──
+    # ── Measure FP16 memory BEFORE compacting (used portion only) ──
     original_bytes = 0
     for c in cache:
         if hasattr(c, 'keys') and c.keys is not None:
-            original_bytes += c.keys.nbytes + c.values.nbytes
+            used = getattr(c, 'offset', c.keys.shape[2])
+            original_bytes += c.keys[:, :, :used, :].nbytes + c.values[:, :, :used, :].nbytes
 
     # ── Compact: free FP16, keep only indices + norms ──
     if compact and layers_compressed > 0:
@@ -241,12 +242,9 @@ def compress_cache(
     # Real cosine: averaged across all compressed layers (measured before overwrite)
     cos = cosine_sum / cosine_count if cosine_count > 0 else 0.0
 
-    # ── Measure ACTUAL memory after compress+compact+restore ──
-    after_bytes = 0
+    # ── Measure compressed representation (indices + norms) ──
     compressed_bytes = 0
     for c in cache:
-        if hasattr(c, 'keys') and c.keys is not None:
-            after_bytes += c.keys.nbytes + c.values.nbytes
         if hasattr(c, '_tq_k_indices') and c._tq_k_indices is not None:
             compressed_bytes += (
                 c._tq_k_indices.nbytes + c._tq_k_norms.nbytes +
