@@ -22,7 +22,7 @@ import time
 import mlx.core as mx
 from typing import Any, Dict, List, Optional, Tuple
 
-from .compressor import PolarQuantMLX
+from .compressor import PolarQuantMLX, pack_indices, unpack_indices
 
 
 def get_head_dim(model) -> int:
@@ -201,12 +201,18 @@ def compress_cache(
         cosine_sum += layer_cos.item()
         cosine_count += 1
 
+        # ── Pack indices for real memory savings ──
+        # 4-bit: 2 per byte (4x vs FP16), 3-bit: 8 per 3 bytes (5.3x vs FP16)
+        k_packed = pack_indices(k_indices, bits)
+        v_packed = pack_indices(v_indices, bits)
+        mx.eval(k_packed, v_packed)
+
         # ── Store compressed representation on the cache object ──
-        # These attributes are read by decompress_cache() or during generation
-        c._tq_k_indices = k_indices                                    # uint8
+        c._tq_k_indices = k_packed                                     # packed bits
         c._tq_k_norms = k_norms.astype(mx.float16)                    # float16
-        c._tq_v_indices = v_indices                                    # uint8
+        c._tq_v_indices = v_packed                                     # packed bits
         c._tq_v_norms = v_norms.astype(mx.float16)                    # float16
+        c._tq_head_dim = kd                                            # for unpack
         c._tq_k_compressor = k_mse                                    # for dequantize
         c._tq_v_compressor = v_mse                                    # for dequantize
         c._tq_compress_end = compress_end                              # how many tokens compressed
@@ -345,11 +351,17 @@ def restore_cache(cache: List[Any]) -> None:
         k_mse = c._tq_k_compressor
         v_mse = c._tq_v_compressor
 
+        # Unpack packed indices back to uint8 for dequantization
+        bits = c._tq_bits
+        hd = c._tq_head_dim
+        k_indices = unpack_indices(c._tq_k_indices, bits, hd)
+        v_indices = unpack_indices(c._tq_v_indices, bits, hd)
+
         # Dequantize compressed region
-        k_hat = k_mse.dequantize(c._tq_k_indices)
+        k_hat = k_mse.dequantize(k_indices)
         k_hat = (k_hat * c._tq_k_norms.astype(mx.float32)).astype(mx.float16)
 
-        v_hat = v_mse.dequantize(c._tq_v_indices)
+        v_hat = v_mse.dequantize(v_indices)
         v_hat = (v_hat * c._tq_v_norms.astype(mx.float32)).astype(mx.float16)
 
         # Append uncompressed window if present

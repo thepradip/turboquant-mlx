@@ -3,6 +3,24 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-*.json
 results/
 .pytest_cache/
+.env
+.DS_Store
+
+# Benchmark results (generated, not source)
+benchmarks/*.json
+benchmarks/*.html
+benchmarks/*.npz
+
+# Keep the questions dataset (source, not generated)
+!benchmarks/tq_eval_65_questions.json
+
+# Root-level experiment results/reports (not source)
+*.pdf
+*.md
+experiment_report.json
+library_comparison_results.json
+long_context_results.json
+qwen35_*.json
+turboquant_mlx_report.json
