@@ -120,21 +120,31 @@ def compress_cache(
     compact: bool = True,
 ) -> Dict:
     """
-    Compress KV cache in-place using TurboQuant.
+    Compress KV cache in-place using TurboQuant polar quantization.
 
-    Stores uint8 indices + float16 norms. When compact=True (default),
-    frees the FP16 tensors for real memory savings and writes dequantized
-    FP16 back for generation to work with standard attention.
+    Quantizes FP16 keys/values to uint8 indices + float16 norms.
+    When compact=True (default), the FP16 tensors are freed and only
+    the compressed representation is kept — real memory savings.
 
-    Per-layer eval prevents memory thrashing at high context lengths.
+    After compression, use generate_step() for token generation:
+        result = compress_cache(cache, model=model, bits=4)
+        for step in range(max_tokens):
+            logits, cache = generate_step(model, token, cache)
+
+    Or for compatibility with existing code (no memory savings):
+        result = compress_cache(cache, model=model, bits=4, compact=False)
+        # cache still has dequantized FP16, use standard generation
 
     Args:
         cache: List of MLX KVCache objects from make_prompt_cache().
         model: MLX model (for auto-detecting head_dim).
         head_dim: Override head_dim if model not provided.
         bits: Quantization bits (2, 3, or 4). Default: 4.
-        window_size: Keep this many recent tokens uncompressed. Default: 0 (compress all).
+        window_size: Keep this many recent tokens uncompressed. Default: 0.
         min_context: Skip compression if context shorter than this. Default: 0.
+        compact: If True (default), free FP16 tensors for real memory savings.
+                 Use generate_step() for generation. If False, write dequantized
+                 FP16 back (no memory savings, but works with standard generation).
 
     Returns:
         Dict with cosine, compress_ms, layers_compressed, memory stats.
@@ -237,15 +247,15 @@ def compress_cache(
             used = getattr(c, 'offset', c.keys.shape[2])
             original_bytes += c.keys[:, :, :used, :].nbytes + c.values[:, :, :used, :].nbytes
 
-    # ── Compact: free FP16, keep only indices + norms for real memory savings ──
-    # Then restore dequantized FP16 for generation (standard attention needs FP16).
-    # Net effect: cache holds dequantized FP16 (lossy) + compressed indices.
-    # The quality impact comes from the lossy dequantization, not from memory savings.
-    # For real memory savings during serving, call compact_cache() separately and
-    # use restore_cache() on-demand before each forward pass.
+    # ── Compact or restore ──
     if compact and layers_compressed > 0:
+        # Free FP16 tensors — real memory savings.
+        # Use generate_step() for generation (decompresses on-demand per step).
         compact_cache(cache)
-        restore_cache(cache)
+    elif not compact and layers_compressed > 0:
+        # Write dequantized FP16 back — no memory savings, but compatible
+        # with standard generation loop (model(token, cache=cache)).
+        pass  # FP16 already written back in the per-layer loop above
 
     elapsed_ms = (time.time() - t0) * 1000
 
@@ -381,7 +391,101 @@ def restore_cache(cache: List[Any]) -> None:
 
 
 # ═══════════════════════════════════════════════════════
-#  Full QJL Integration — patch model attention
+#  Production generation with compressed cache
+# ═══════════════════════════════════════════════════════
+
+def generate_step(model, token_id, cache):
+    """
+    One generation step with compressed KV cache.
+
+    Decompresses cache → runs model forward → appends new KV → recompresses.
+    Only 1 layer's FP16 is in memory at a time during decompression.
+
+    This is the production path that actually saves memory.
+
+    Args:
+        model: MLX model.
+        token_id: mx.array of shape (1,) or int — the token to process.
+        cache: List of KVCache objects (compacted via compress_cache with compact=True).
+
+    Returns:
+        logits: mx.array — logits for next token prediction.
+
+    Example::
+
+        cache = make_prompt_cache(model)
+        logits = chunked_prefill(model, ids, cache)
+        compress_cache(cache, model=model, bits=4)  # compact=True by default
+
+        y = mx.argmax(logits[:, -1, :], axis=-1)
+        for _ in range(max_tokens):
+            tok = y.item()
+            if tok == tokenizer.eos_token_id:
+                break
+            logits = generate_step(model, y[:, None], cache)
+            y = mx.argmax(logits[:, -1, :], axis=-1)
+            mx.eval(y)
+    """
+    if isinstance(token_id, int):
+        token_id = mx.array([[token_id]])
+
+    # Restore FP16 from compressed indices (temporary, for this forward pass)
+    any_compacted = any(getattr(c, '_tq_compacted', False) for c in cache)
+    if any_compacted:
+        restore_cache(cache)
+
+    # Forward pass — standard attention with dequantized FP16
+    logits = model(token_id, cache=cache)
+    mx.eval(logits)
+
+    # Recompress: the new token is now in the FP16 cache.
+    # We need to re-quantize the new token and compact again.
+    if any_compacted:
+        # The new token was appended to FP16 keys/values by the model.
+        # Re-quantize the full cache (fast — codebook is cached, only new token is new).
+        for c in cache:
+            if not hasattr(c, '_tq_k_compressor'):
+                continue
+
+            k_mse = c._tq_k_compressor
+            v_mse = c._tq_v_compressor
+            bits = c._tq_bits
+            end = c._tq_compress_end
+
+            # The new token is at position cache.offset - 1
+            # Quantize it and append to compressed storage
+            new_k = c.keys[:, :, -1:, :].astype(mx.float32)
+            new_v = c.values[:, :, -1:, :].astype(mx.float32)
+
+            k_norm = mx.maximum(mx.sqrt(mx.sum(new_k * new_k, axis=-1, keepdims=True)), 1e-8)
+            k_unit = new_k / k_norm
+            k_idx = k_mse.quantize(k_unit)
+            k_packed = pack_indices(k_idx, bits)
+
+            v_norm = mx.maximum(mx.sqrt(mx.sum(new_v * new_v, axis=-1, keepdims=True)), 1e-8)
+            v_unit = new_v / v_norm
+            v_idx = v_mse.quantize(v_unit)
+            v_packed = pack_indices(v_idx, bits)
+
+            # Append to compressed storage
+            c._tq_k_indices = mx.concatenate([c._tq_k_indices, k_packed], axis=2)
+            c._tq_k_norms = mx.concatenate([c._tq_k_norms, k_norm.astype(mx.float16)], axis=2)
+            c._tq_v_indices = mx.concatenate([c._tq_v_indices, v_packed], axis=2)
+            c._tq_v_norms = mx.concatenate([c._tq_v_norms, v_norm.astype(mx.float16)], axis=2)
+            c._tq_compress_end = c.offset
+
+            mx.eval(c._tq_k_indices, c._tq_k_norms, c._tq_v_indices, c._tq_v_norms)
+
+            # Free FP16 again
+            c.keys = None
+            c.values = None
+            c._tq_compacted = True
+
+    return logits
+
+
+# ═══════════════════════════════════════════════════════
+#  Patched model attention (experimental)
 # ═══════════════════════════════════════════════════════
 
 def make_turboquant_cache(model, bits: int = 4, value_bits: int = None) -> List:

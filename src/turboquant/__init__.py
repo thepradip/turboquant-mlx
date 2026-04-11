@@ -4,6 +4,7 @@ from .patch import (
     compress_cache,
     compact_cache,
     restore_cache,
+    generate_step,
     chunked_prefill,
     patch_model,
     make_turboquant_cache,
