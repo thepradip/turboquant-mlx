@@ -237,10 +237,14 @@ def compress_cache(
             used = getattr(c, 'offset', c.keys.shape[2])
             original_bytes += c.keys[:, :, :used, :].nbytes + c.values[:, :, :used, :].nbytes
 
-    # ── Compact: free FP16, keep only indices + norms ──
+    # ── Compact: free FP16, keep only indices + norms for real memory savings ──
+    # Then restore dequantized FP16 for generation (standard attention needs FP16).
+    # Net effect: cache holds dequantized FP16 (lossy) + compressed indices.
+    # The quality impact comes from the lossy dequantization, not from memory savings.
+    # For real memory savings during serving, call compact_cache() separately and
+    # use restore_cache() on-demand before each forward pass.
     if compact and layers_compressed > 0:
         compact_cache(cache)
-        # Restore dequantized FP16 for generation to work with standard attention
         restore_cache(cache)
 
     elapsed_ms = (time.time() - t0) * 1000
@@ -400,10 +404,15 @@ def make_turboquant_cache(model, bits: int = 4, value_bits: int = None) -> List:
 
 def patch_model(model, bits: int = 4):
     """
-    Monkey-patch model attention to use QJL-corrected scores with TurboQuantCache.
+    Monkey-patch model attention to use TurboQuantCache with SDPA.
+
+    NOTE: This is experimental. The recommended path is:
+      cache = make_prompt_cache(model)
+      compress_cache(cache, model=model, bits=bits)
+    which works without patching.
 
     After patching, use make_turboquant_cache() to create the cache, then
-    model(ids, cache=cache) automatically compresses KV and applies QJL correction.
+    model(ids, cache=cache) automatically compresses KV.
     """
     import types
     from .cache import TurboQuantCache
@@ -414,9 +423,11 @@ def patch_model(model, bits: int = 4):
 
     for i, layer in enumerate(model.layers):
         attn = None
+        attn_name = None
         for name in ['self_attn', 'attention', 'attn']:
             if hasattr(layer, name):
                 attn = getattr(layer, name)
+                attn_name = name
                 break
         if attn is None or not hasattr(attn, 'q_proj'):
             continue
@@ -459,7 +470,13 @@ def patch_model(model, bits: int = 4):
                 return self.o_proj(output)
             return patched_call
 
-        attn.__call__ = types.MethodType(make_patched(attn), attn)
+        # Patch the class method on this specific instance's class to ensure
+        # Python's method resolution finds it. Create a per-instance subclass.
+        AttnClass = type(attn)
+        patched_cls = type(f"Patched{AttnClass.__name__}", (AttnClass,), {
+            "__call__": make_patched(attn),
+        })
+        attn.__class__ = patched_cls
         patched += 1
 
     return patched

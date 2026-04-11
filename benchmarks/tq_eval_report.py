@@ -637,7 +637,7 @@ headline_cards = [
     (_best_model["summary"]["fp16"].get("judge_avg_score",0), "/10", "Best Accuracy", f'{_best_model["label"]} FP16', "indigo"),
     (f'{_fastest["summary"]["fp16"]["avg_gen_tps"]:.0f}', " tok/s", "Fastest Throughput", f'{_fastest["label"]} FP16', "emerald"),
     (f'{_smallest_mem["summary"]["fp16"]["avg_metal_peak_mb"]:.0f}', " MB", "Lowest Memory", f'{_smallest_mem["label"]} FP16', "sky"),
-    ("74.6", "%", "KV Memory Saved", "TQ 4-bit (all models)", "indigo"),
+    (f'{mean(m["degradation"].get("tq_4bit_vs_fp16",{}).get("memory_savings_pct",0) for m in models):.1f}', "%", "KV Memory Saved", "TQ 4-bit (all models)", "indigo"),
 ]
 for val, unit, label, detail, color in headline_cards:
     h += f'''<div class="c" style="text-align:center;border-top:3px solid var(--{color});">

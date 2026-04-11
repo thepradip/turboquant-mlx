@@ -332,7 +332,15 @@ def load_bonsai_1bit(path_or_hf_repo, lazy=False, tokenizer_config=None):
     model = bonsai_1bit_quantize(model, group_size=group_size, weights=weights)
     model.eval()
 
-    # Load weights
+    # Load weights with key audit
+    model_keys = set(k for k, _ in model.parameters())
+    weight_keys = set(weights.keys())
+    missing = model_keys - weight_keys
+    unexpected = weight_keys - model_keys
+    if missing:
+        print(f"  WARNING: {len(missing)} missing keys in checkpoint: {list(missing)[:5]}...")
+    if unexpected:
+        print(f"  INFO: {len(unexpected)} extra keys in checkpoint (ignored)")
     model.load_weights(list(weights.items()), strict=False)
 
     if not lazy:
