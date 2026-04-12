@@ -452,9 +452,10 @@ def generate_step(model, token_id, cache):
             v_mse = c._tq_v_compressor
             bits = c._tq_bits
 
-            # Quantize only the new token (last position)
-            new_k = c.keys[:, :, -1:, :].astype(mx.float32)
-            new_v = c.values[:, :, -1:, :].astype(mx.float32)
+            # Read new token at exact offset position (NOT -1, because KVCache pre-allocates)
+            pos = c.offset - 1
+            new_k = c.keys[:, :, pos:pos+1, :].astype(mx.float32)
+            new_v = c.values[:, :, pos:pos+1, :].astype(mx.float32)
 
             k_norm = mx.maximum(mx.sqrt(mx.sum(new_k * new_k, axis=-1, keepdims=True)), 1e-8)
             k_idx = k_mse.quantize(new_k / k_norm)

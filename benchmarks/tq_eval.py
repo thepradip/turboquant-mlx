@@ -248,14 +248,10 @@ def llm_judge(question, reference_answer, model_answer, category, client, judge_
 
 
 def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
-    """Generate with compress_cache(compact=False) — measures quality and compression ratio.
+    """Generate using production path: compact=True + generate_step() for TQ modes.
+    FP16 uses standard generation (no compression)."""
+    from turboquant import generate_step
 
-    NOTE: Uses compact=False because generate_step() has a known quality degradation
-    bug — re-quantizing new tokens each step causes cumulative error that diverges
-    after ~20 tokens. Until generate_step() is fixed, compact=False is the correct
-    path for quality benchmarking. Memory savings metrics come from kv_compressed_mb
-    vs kv_fp16_mb ratio (theoretical, not runtime).
-    """
     stop_tokens = _get_stop_tokens(tokenizer)
     ids = mx.array(tokenizer.encode(prompt))
     n_prompt = len(ids)
@@ -286,10 +282,12 @@ def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
 
     comp_info = None
     compress_ms = 0
+    use_generate_step = False
     if kv_mode != "fp16":
         t1 = time.time()
-        comp_info = compress_cache(cache, model=model, bits=bits, compact=False)
+        comp_info = compress_cache(cache, model=model, bits=bits, compact=True)
         compress_ms = (time.time() - t1) * 1000
+        use_generate_step = True
 
     ttft_ms = prefill_ms + compress_ms
     mx.eval(mx.array([0]))
@@ -305,8 +303,11 @@ def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
             break
         t_tok = time.time()
         tokens.append(tok_id)
-        logits = model(y[:, None], cache=cache)
-        mx.eval(logits)
+        if use_generate_step:
+            logits = generate_step(model, y[:, None], cache)
+        else:
+            logits = model(y[:, None], cache=cache)
+            mx.eval(logits)
         y = mx.argmax(logits[:, -1, :], axis=-1)
         mx.eval(y)
         token_times.append((time.time() - t_tok) * 1000)
