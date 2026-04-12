@@ -248,7 +248,14 @@ def llm_judge(question, reference_answer, model_answer, category, client, judge_
 
 
 def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
-    """Generate with unbiased MLX Metal memory metrics."""
+    """Generate with compress_cache(compact=False) — measures quality and compression ratio.
+
+    NOTE: Uses compact=False because generate_step() has a known quality degradation
+    bug — re-quantizing new tokens each step causes cumulative error that diverges
+    after ~20 tokens. Until generate_step() is fixed, compact=False is the correct
+    path for quality benchmarking. Memory savings metrics come from kv_compressed_mb
+    vs kv_fp16_mb ratio (theoretical, not runtime).
+    """
     stop_tokens = _get_stop_tokens(tokenizer)
     ids = mx.array(tokenizer.encode(prompt))
     n_prompt = len(ids)
