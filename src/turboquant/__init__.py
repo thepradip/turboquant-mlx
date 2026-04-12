@@ -5,6 +5,8 @@ from .patch import (
     compact_cache,
     restore_cache,
     generate_step,
+    generate_step_fused,
+    patch_model_fused,
     chunked_prefill,
     patch_model,
     make_turboquant_cache,
@@ -12,6 +14,7 @@ from .patch import (
     get_num_layers,
     get_model_config,
 )
+from .fused_attention import fused_turboquant_sdpa
 from .results import save_experiment, list_experiments, load_experiment
 from .compressor import PolarQuantMLX
 from .cache import TurboQuantCache
