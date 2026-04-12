@@ -48,14 +48,14 @@ Based on: [TurboQuant (Google Research, ICLR 2026)](https://arxiv.org/abs/2504.1
 
 ```bash
 pip install mlx mlx-lm scipy
-pip install git+https://github.com/thepradip/turboquant-m2.git
+pip install git+https://github.com/thepradip/turboquant-mlx.git
 ```
 
 ### From Source (for development)
 
 ```bash
-git clone https://github.com/thepradip/turboquant-m2.git
-cd turboquant-m2
+git clone https://github.com/thepradip/turboquant-mlx.git
+cd turboquant-mlx
 pip install -e ".[dev]"
 ```
 
@@ -277,7 +277,7 @@ data = load_experiment("qwen3.5-4b-mlx-4bit_8192tok_20260329_120000.json")
 The included benchmark script tests baseline vs TurboQuant across multiple context lengths:
 
 ```bash
-cd turboquant-m2
+cd turboquant-mlx
 python examples/benchmark.py --model mlx-community/Qwen3.5-4B-MLX-4bit
 ```
 
@@ -475,16 +475,17 @@ Process long prompts in chunks to bypass Metal's 8 GB buffer limit.
 | `list_experiments(model_filter=None)` | List all saved results, sorted newest first |
 | `load_experiment(filename)` | Load specific result file by filename |
 
-### Advanced (QJL / Custom Cache)
+### Advanced / Experimental
 
 | Function | Description |
 |:---|:---|
-| `patch_model(model, bits=4)` | Monkey-patch attention for QJL-corrected scores |
+| `patch_model(model, bits=4)` | Monkey-patch attention (experimental, not production-tested) |
 | `make_turboquant_cache(model, bits=4)` | Create TurboQuantCache instances for all layers |
-| `TurboQuantCache(head_dim, key_bits, value_bits, use_qjl)` | Drop-in KVCache with on-insert compression |
-| `turboquant_sdpa(queries, keys, values, cache, scale)` | Scaled dot-product attention with optional QJL |
+| `TurboQuantCache(head_dim, key_bits, value_bits)` | Drop-in KVCache with on-insert compression |
+| `turboquant_sdpa(queries, keys, values, cache, scale)` | Standard SDPA with dequantized KV cache |
 | `PolarQuantMLX(head_dim, bits, seed)` | Low-level: quantize/dequantize unit-sphere vectors |
-| `QJLMLX(head_dim, m, seed)` | Low-level: QJL residual projection (disabled) |
+
+> **Note**: QJL residual correction (`qjl.py`) is implemented but disabled — 4-bit MSE provides sufficient quality (0.991+ cosine) without the added variance. The code is kept for future research at lower bit widths.
 
 ---
 
@@ -503,9 +504,10 @@ Process long prompts in chunks to bypass Metal's 8 GB buffer limit.
 Keep recent tokens in full FP16 for better quality on local attention:
 
 ```python
-compress_cache(cache, model=model, bits=4, window_size=512)
+compress_cache(cache, model=model, bits=4, window_size=512, compact=False)
 # Compresses all tokens EXCEPT the most recent 512
-# Useful for long-context where recent tokens matter more
+# NOTE: window_size > 0 requires compact=False (standard generation loop)
+# generate_step() only works with window_size=0
 ```
 
 ### Minimum Context
@@ -523,22 +525,24 @@ compress_cache(cache, model=model, bits=4, min_context=1024)
 
 ```
 src/turboquant/
-├── __init__.py       # Public API: compress_cache, compact_cache, restore_cache, ...
-├── patch.py          # Main API: compress, compact, restore, chunked_prefill
-├── compressor.py     # PolarQuant: boundary-search quantization (v0.5.0)
+├── __init__.py       # Public API exports
+├── patch.py          # Core: compress_cache, generate_step, chunked_prefill
+├── compressor.py     # PolarQuant: polar quantization (2/3/4-bit)
 ├── codebook.py       # Lloyd-Max codebook + rotation matrix builders
-├── cache.py          # TurboQuantCache: stores uint8 indices + float16 norms
-├── attention.py      # Custom SDPA with optional QJL correction
-├── results.py        # Experiment save/list/load with hardware auto-detection
-├── qjl.py            # QJL residual correction (written, disabled)
-├── metal_kernel.py   # Fused Metal kernel (validated, not in production path)
-├── torch_backend.py  # PyTorch backend (CPU/CUDA/MPS)
-└── mlx_native.py     # Pure MLX implementation (alternative)
+├── cache.py          # TurboQuantCache: uint8 indices + float16 norms
+├── attention.py      # Standard SDPA with dequantized KV cache
+├── results.py        # Experiment save/list/load
+├── qjl.py            # QJL residual correction (disabled, kept for research)
+├── metal_kernel.py   # Fused Metal kernel (used by bonsai_loader)
+└── bonsai_loader.py  # 1-bit Bonsai model loader
 
-examples/
-└── benchmark.py      # Full benchmark: baseline vs mlx_quantized vs turboquant
+benchmarks/
+├── tq_eval.py                # Unified eval suite (65 questions, LLM-as-judge)
+├── tq_eval_report.py         # HTML report generator
+└── tq_eval_65_questions.json # Test dataset with reference answers
 
-results/              # Auto-created. Timestamped JSON experiment results
+tests/
+└── test_core.py      # 55 tests: round-trip, pack/unpack, compress, generate_step
 ```
 
 ---
@@ -560,23 +564,22 @@ Any model loaded via `mlx_lm.load()` should work. Config is auto-detected. Model
 
 | Feature | v0.4.0 | v0.5.0 |
 |:---|:---|:---|
-| Memory savings | None (wrote FP16 back) | **2.0x real** (uint8 + float16 norms) |
+| Memory savings | None (wrote FP16 back) | **Real savings** via `generate_step()` |
 | Quantization speed | Brute-force argmin | **29x faster** (boundary comparisons) |
 | 8K compression | ~5.3s | **0.71s** (per-layer eval) |
 | 32K compression | 143s (graph explosion) | Linear scaling restored |
-| QJL memory | Always stored | **Off by default** |
-| Cosine computation | 67 MB/layer alloc every run | Known constant lookup |
-| New API | — | `compact_cache()`, `restore_cache()` |
+| Eval suite | None | **65 questions, LLM-as-judge, 3-model comparison** |
+| New API | — | `generate_step()`, `compact_cache()`, `restore_cache()` |
 
 ---
 
 ## Known Issues & Limitations
 
-- **Hybrid attention**: Qwen3.5 models only compress 8/32 layers. Gemma3 compresses all 34/34 layers and benefits more.
-- **QJL disabled**: Stage 2 of the paper adds variance at 4-bit. May work at 2-bit. Enable with `TurboQuantCache(head_dim, use_qjl=True)`.
-- **Apple Silicon only**: Uses MLX. A PyTorch backend exists (`torch_backend.py`) but is untested in production.
-- **compact/restore overhead**: `restore_cache()` reconstructs FP16 before each generation step. For continuous generation without memory pressure, `compress_cache()` alone is simpler.
-- **2.0x not 4.0x**: The ratio is 2.0x (uint8 vs float16 = 1 byte vs 2 bytes) not the theoretical 3.9x (4-bit indices), because MLX stores uint8 indices which are 8-bit, not 4-bit packed.
+- **Hybrid attention**: Qwen3.5 models only compress 8/32 layers. Gemma compresses all layers and benefits more.
+- **Apple Silicon only**: Uses MLX. No PyTorch backend.
+- **generate_step overhead**: `restore_cache()` reconstructs full FP16 before each forward pass. Peak memory during a step = full FP16. Savings are between steps, not during.
+- **window_size > 0**: Not compatible with `generate_step()`. Use `compact=False` with standard generation loop instead.
+- **QJL disabled**: Residual correction implemented (`qjl.py`) but disabled — 4-bit MSE provides 0.991+ cosine without it. Kept for future research at lower bit widths.
 
 ---
 
@@ -619,9 +622,9 @@ print(savings['actual_saved_mb'])
 
 ### Model generates garbage after compression
 
-This should not happen — compression preserves cosine 0.9953. If it does:
+This should not happen — compression preserves cosine 0.991+. If it does:
 1. Check `result['layers_compressed']` — should be >0
-2. Try `window_size=512` to keep recent tokens uncompressed
+2. Ensure you use `compact=False` with standard generation, or `generate_step()` with `compact=True`
 3. Try `bits=4` (not 2 or 3)
 
 ### Import error: "No module named turboquant"
@@ -629,13 +632,13 @@ This should not happen — compression preserves cosine 0.9953. If it does:
 Install from source:
 
 ```bash
-pip install git+https://github.com/thepradip/turboquant-m2.git
+pip install git+https://github.com/thepradip/turboquant-mlx.git
 ```
 
 Or if developing locally:
 
 ```bash
-cd turboquant-m2
+cd turboquant-mlx
 pip install -e .
 ```
 

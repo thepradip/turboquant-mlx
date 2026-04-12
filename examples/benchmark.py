@@ -130,7 +130,7 @@ def run_single_test(model, tokenizer, ids, context_len, mode, model_name):
         compress_ms = 0
 
         if mode == "turboquant":
-            compress_result = compress_cache(cache, model=model, bits=BITS)
+            compress_result = compress_cache(cache, model=model, bits=BITS, compact=False)
             compress_ms = compress_result.get("compress_ms", 0)
             result["kv_memory_after_mb"] = round(measure_kv_mb(cache), 1)
             # v0.5.0: measure real compressed size from indices+norms
